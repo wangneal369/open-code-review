@@ -1,0 +1,108 @@
+# OpenCodeReview - Gitea Actions Pull Request Auto-Review
+#
+# Reviews pull requests with OpenCodeReview and posts the findings onto the
+# PR as inline review comments plus a summary conversation comment.
+#
+# The posting glue lives in the CI layer, in post_review.py next to this
+# file -- consistent with the GitHub Actions, GitLab CI and Gerrit examples,
+# which keep platform-specific publishing out of the `ocr` binary.
+#
+# Setup:
+#   - Commit BOTH this file and post_review.py into your repository (adjust
+#     the `python3 post_review.py` path below if you place the script
+#     elsewhere).
+#   - Enable "Actions" for the repository (Settings -> Repository ->
+#     Gitea Actions) and register a Gitea Runner.
+#   - The runner needs a job image with node 20+, python3 and git available.
+#
+# Required CI/CD Variables (Settings -> Actions -> Variables):
+#   OCR_LLM_URL        - LLM API endpoint (e.g., https://api.openai.com/v1/chat/completions)
+#   OCR_LLM_AUTH_TOKEN - Authentication token for the LLM API
+#   GITEA_TOKEN        - Gitea access token used to post PR review comments
+#
+# Optional CI/CD Variables:
+#   OCR_LLM_MODEL      - Model name (e.g., gpt-4o); OCR has no built-in default
+#   OCR_VERSION        - npm version spec for @alibaba-group/open-code-review
+#                        (default: latest). Pin it (e.g. 1.9.0) for
+#                        reproducible reviews.
+#   OCR_LLM_USE_ANTHROPIC - 'true' for the Anthropic API format, 'false' (default)
+#                        for OpenAI-compatible APIs
+#   OCR_BACKGROUND     - Business/requirement context passed to `ocr review`
+#   OCR_RULE           - Path to a custom rules JSON file
+
+name: OpenCodeReview PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          # The review must run against the full history so the merge base
+          # with the target branch can be computed.
+          fetch-depth: 0
+
+      - name: Install OpenCodeReview
+        run: |
+          npm install -g @alibaba-group/open-code-review@${OCR_VERSION:-latest}
+
+      - name: Configure OCR
+        env:
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ vars.OCR_LLM_MODEL }}
+          OCR_LLM_USE_ANTHROPIC: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+        run: |
+          : "${OCR_LLM_URL:?set OCR_LLM_URL in Settings -> Actions -> Variables}"
+          : "${OCR_LLM_AUTH_TOKEN:?set OCR_LLM_AUTH_TOKEN in Settings -> Actions -> Variables}"
+          ocr config set llm.url "$OCR_LLM_URL"
+          ocr config set llm.auth_token "$OCR_LLM_AUTH_TOKEN"
+          if [ -n "$OCR_LLM_MODEL" ]; then
+            ocr config set llm.model "$OCR_LLM_MODEL"
+          fi
+          if [ "${OCR_LLM_USE_ANTHROPIC:-false}" = "true" ]; then
+            ocr config set llm.use_anthropic true
+          else
+            ocr config set llm.use_anthropic false
+          fi
+          ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
+
+      - name: Fetch the target branch
+        env:
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --unshallow 2>/dev/null || true
+          git fetch origin "$TARGET_BRANCH"
+
+      - name: Run the review
+        env:
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OCR_BACKGROUND: ${{ vars.OCR_BACKGROUND }}
+          OCR_RULE: ${{ vars.OCR_RULE }}
+        run: |
+          mkdir -p .ocr
+          # The head SHA (not the branch name) is used as the review target so
+          # pull requests from forks are reviewed correctly.
+          ocr review \
+            --from "origin/${TARGET_BRANCH}" \
+            --to "${HEAD_SHA}" \
+            --format json \
+            --audience agent \
+            > .ocr/ocr-result.json || true
+          echo "OCR review completed."
+
+      - name: Post the review comments
+        env:
+          # The posting script resolves the PR context from these variables.
+          GITEA_SERVER_URL: ${{ github.server_url }}
+          GITEA_REPOSITORY: ${{ github.repository }}
+          GITEA_PULL_REQUEST_INDEX: ${{ github.event.pull_request.number }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: python3 post_review.py .ocr/ocr-result.json
