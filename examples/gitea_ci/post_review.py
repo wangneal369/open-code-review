@@ -461,19 +461,33 @@ def parse_diff_hunk_inventory(patch):
     ``new`` maps new-file line numbers to ``"added"`` or ``"context"``;
     ``old`` maps old-file line numbers the same way. Deleted lines appear in
     neither map, matching what a review comment may anchor to.
+
+    The inventory also carries a ``"complete"`` flag. It is False when the
+    patch looks truncated, i.e. a hunk declares more lines than it carries.
+    On incomplete data the caller must not conclude that a finding is out of
+    diff, because the missing lines are exactly the ones that cannot be
+    checked.
     """
     inventory = {}
     current = None
     new_ln = 0
     old_ln = 0
+    complete = True
 
     def flush():
+        nonlocal complete
         if current is not None:
-            inventory.setdefault(current["path"], {"new": {}, "old": {}})
+            entry = inventory.setdefault(current["path"], {"new": {}, "old": {}})
             for k, v in current["new"].items():
-                inventory[current["path"]]["new"].setdefault(k, v)
+                entry["new"].setdefault(k, v)
             for k, v in current["old"].items():
-                inventory[current["path"]]["old"].setdefault(k, v)
+                entry["old"].setdefault(k, v)
+            # A hunk that declares N new lines but carries fewer means the
+            # patch was cut short. The lines beyond the truncation point
+            # cannot be verified.
+            if current.get("hunk_new_count") is not None:
+                if current.get("hunk_new_seen", 0) < current["hunk_new_count"]:
+                    complete = False
 
     for line in str(patch or "").splitlines():
         if line.startswith("diff --git "):
@@ -501,14 +515,19 @@ def parse_diff_hunk_inventory(patch):
         if line.startswith("--- "):
             continue
         if line.startswith("@@"):
-            m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            m = re.match(r"^@@ -(\d+)(?:,(\d+)?)? \+(\d+)(?:,(\d+)?)? @@", line)
             if m:
                 old_ln = int(m.group(1))
                 new_ln = int(m.group(3))
+                current["hunk_new_start"] = new_ln
+                current["hunk_new_count"] = (1 if m.group(4) is None
+                                              else int(m.group(4)))
+                current["hunk_new_seen"] = 0
             continue
         if line.startswith("+"):
             current["new"][new_ln] = "added"
             new_ln += 1
+            current["hunk_new_seen"] = current.get("hunk_new_seen", 0) + 1
             continue
         if line.startswith("-"):
             old_ln += 1
@@ -518,9 +537,30 @@ def parse_diff_hunk_inventory(patch):
             current["old"][old_ln] = "context"
             new_ln += 1
             old_ln += 1
+            current["hunk_new_seen"] = current.get("hunk_new_seen", 0) + 1
             continue
     flush()
+
+    # A hunk that declares N new lines but carries fewer means the patch was
+    # cut short. Lines beyond the truncation point cannot be verified, so the
+    # inventory as a whole is only partially trustworthy.
+    for entry in inventory.values():
+        entry["complete"] = complete
     return inventory
+
+
+def inventory_is_complete(inventory):
+    """True when the parsed diff can be trusted to prove a line out of diff.
+
+    An empty inventory means the diff could not be parsed at all, which is
+    likewise "unknown" rather than "nothing is in the diff".
+    """
+    if not inventory:
+        return False
+    for entry in inventory.values():
+        if not entry.get("complete", True):
+            return False
+    return True
 
 
 def line_is_anchorable(inventory, path, line):
@@ -539,19 +579,32 @@ def line_is_anchorable(inventory, path, line):
 
 
 def validate_comment_against_diff(comment, inventory):
-    """Return a reason string when the comment cannot be anchored, else None."""
+    """Return a reason string when the comment cannot be anchored, else None.
+
+    When the inventory is incomplete (the patch looked truncated) a line that
+    is not in the inventory cannot be proven to be out of diff: the missing
+    lines are precisely the ones that could not be checked. Such a finding is
+    therefore passed through and left for the server to resolve, mirroring
+    the GitLab example, which declines to classify against partial data.
+    """
     path = comment.get("path", "")
     span = comment_span(comment)
     if span is None:
         return NO_LINE_REASON
     if path not in inventory:
-        return PATH_NOT_IN_DIFF_REASON
+        # A truncated patch may have dropped whole files, so an unknown path
+        # is not provably out of diff either.
+        if inventory_is_complete(inventory):
+            return PATH_NOT_IN_DIFF_REASON
+        return None
     # Gitea anchors a comment to a single line. For a multi-line finding the
     # end line is the anchor (the last line of the offending block), matching
     # the Gerrit example.
     anchor = span["end"]
     if not line_is_anchorable(inventory, path, anchor):
-        return LINE_NOT_IN_DIFF_REASON
+        if inventory_is_complete(inventory):
+            return LINE_NOT_IN_DIFF_REASON
+        return None
     return None
 
 
@@ -1117,6 +1170,10 @@ def build_config(env):
         "retry_base_delay": int(env.get("OCR_RETRY_BASE_DELAY", "2000")) / 1000,
         "max_retries": int(env.get("OCR_MAX_RETRIES", "3")),
         "max_retry_delay": int(env.get("OCR_MAX_RETRY_DELAY", "60000")) / 1000,
+        # Base delay for transient server errors. Gitea has no rate-limit
+        # headers to honour, so this is the only escalation path; the key is
+        # kept for parity with the other platform examples.
+        "transient_base_delay": 2.0,
         # Publication policy + summary + incremental.
         "sticky_summary": _parse_bool(env.get("OCR_STICKY_SUMMARY", "true"), default=True),
         "incremental": _parse_bool(env.get("OCR_INCREMENTAL", "false"), default=False),

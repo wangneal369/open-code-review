@@ -26,11 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import post_review as pr  # noqa: E402
 
 
+# The hunk header must agree with the number of lines the hunk carries:
+# 3 context lines plus 3 added lines make 6 new-file lines.
 PATCH = """diff --git a/src/main.go b/src/main.go
 index abc1234..def5678 100644
 --- a/src/main.go
 +++ b/src/main.go
-@@ -10,6 +10,7 @@ func main() {
+@@ -10,4 +10,6 @@ func main() {
  \tctx := context.Background()
 +\tif err := run(ctx); err != nil {
 +\t\treturn err
@@ -309,6 +311,65 @@ class DiffInventoryTests(unittest.TestCase):
     def test_validate_multiline_uses_end_line_as_anchor(self):
         comment = {"path": "src/main.go", "start_line": 11, "end_line": 13}
         self.assertIsNone(pr.validate_comment_against_diff(comment, self.inventory))
+
+
+TRUNCATED_PATCH = """diff --git a/src/main.go b/src/main.go
+index abc1234..def5678 100644
+--- a/src/main.go
++++ b/src/main.go
+@@ -10,4 +10,6 @@ func main() {
+ \tctx := context.Background()
++\tif err := run(ctx); err != nil {
++\t\treturn err
+"""
+
+
+class TruncatedDiffTests(unittest.TestCase):
+    """A patch that was cut short cannot prove a finding out of diff.
+
+    Gitea applies a review atomically: one unresolvable line rejects the
+    whole request. A truncated patch would therefore make the script drop
+    legitimate findings into the summary, so the inventory has to report the
+    truncation and the validation has to stop rejecting on partial data.
+    """
+
+    def setUp(self):
+        self.inventory = pr.parse_diff_hunk_inventory(TRUNCATED_PATCH)
+
+    def test_truncated_patch_is_not_complete(self):
+        self.assertFalse(pr.inventory_is_complete(self.inventory))
+
+    def test_complete_patch_is_complete(self):
+        self.assertTrue(pr.inventory_is_complete(
+            pr.parse_diff_hunk_inventory(PATCH)))
+
+    def test_empty_inventory_is_not_complete(self):
+        self.assertFalse(pr.inventory_is_complete({}))
+
+    def test_out_of_diff_line_is_not_rejected_on_truncated_data(self):
+        comment = {"path": "src/main.go", "start_line": 40, "end_line": 40}
+        self.assertIsNone(pr.validate_comment_against_diff(comment, self.inventory))
+
+    def test_unknown_path_is_not_rejected_on_truncated_data(self):
+        comment = {"path": "src/never_seen.go", "start_line": 1, "end_line": 1}
+        self.assertIsNone(pr.validate_comment_against_diff(comment, self.inventory))
+
+    def test_missing_line_information_is_still_rejected(self):
+        comment = {"path": "src/main.go", "content": "x"}
+        self.assertEqual(pr.validate_comment_against_diff(comment, self.inventory),
+                         pr.NO_LINE_REASON)
+
+    def test_out_of_diff_line_is_rejected_on_complete_data(self):
+        complete = pr.parse_diff_hunk_inventory(PATCH)
+        comment = {"path": "src/main.go", "start_line": 999, "end_line": 999}
+        self.assertEqual(pr.validate_comment_against_diff(comment, complete),
+                         pr.LINE_NOT_IN_DIFF_REASON)
+
+    def test_unknown_path_is_rejected_on_complete_data(self):
+        complete = pr.parse_diff_hunk_inventory(PATCH)
+        comment = {"path": "src/never_seen.go", "start_line": 1, "end_line": 1}
+        self.assertEqual(pr.validate_comment_against_diff(comment, complete),
+                         pr.PATH_NOT_IN_DIFF_REASON)
 
 
 class ChunkTests(unittest.TestCase):

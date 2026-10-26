@@ -53,11 +53,28 @@ Go to your repository's **Settings → Actions → Variables** and add:
 
 ### 3. Create a Gitea Access Token
 
-You need a token with write permission to post review comments on pull
-requests. Options:
+You need a token that can read and write both pull request reviews and
+issue comments. Gitea splits these into separate scopes, and the script
+uses both: inline findings go to the pull request review endpoint while the
+sticky summary goes to the issue comment endpoint.
 
-- **Repository Access Token** (recommended): Settings → Actions → Runners → ... → or use an organization token
-- **Personal Access Token**: User Settings → Applications → Generate Token with `write:repository` scope
+The required scopes are:
+
+| Scope | Used for |
+|---|---|
+| `write:repository` | Creating the pull request review that carries the inline comments, reading the pull request diff, reporting the commit status |
+| `read:issue` | Listing the existing conversation comments so the sticky summary can be updated in place instead of duplicated |
+| `write:issue` | Creating and updating the summary conversation comment |
+
+> **Note:** A token with only `write:repository` is not enough. Without
+> `read:issue` the script cannot list the existing comments, so it skips the
+> summary upsert and never refreshes the summary. Without `write:issue` the
+> summary comment cannot be created at all.
+
+Options:
+
+- **Personal Access Token** (recommended): User Settings → Applications → Generate Token with the scopes above
+- **Repository Access Token**: Settings → Actions → Runners → ... → or use an organization token
 
 Set it as the `GITEA_TOKEN` repository variable (masked).
 
@@ -90,6 +107,12 @@ rules that differ from the GitHub and GitLab examples:
   (`GET /pulls/{index}.diff`, served as `text/plain`) and moves findings
   whose line is not part of the diff into the summary note instead of
   losing the whole batch.
+- **A truncated patch cannot prove a finding out of diff.** The script
+  compares the line count each hunk declares with the number of lines it
+  carries. When the patch was cut short, the lines beyond the cut are
+  exactly the ones that could not be checked, so the script stops rejecting
+  findings and lets the server resolve them. This mirrors the GitLab
+  example, which likewise declines to classify against partial data.
 - **The summary is a conversation comment**, not a review body. A submitted
   Gitea review cannot be edited (only deleted), so the sticky summary lives
   on `POST /repos/{owner}/{repo}/issues/{index}/comments` where it can be
@@ -180,3 +203,42 @@ python3 post_review_test.py
 # From the repo root
 python3 -m unittest discover -s examples/gitea_ci -p '*_test.py'
 ```
+
+Two additional test suites live next to the script:
+
+- `parity_test.py` loads the GitLab example side by side with this one and
+  asserts that both produce the same badges, routing decisions, ordering,
+  summary structure, configuration surface and job gating. The few
+  deliberate platform differences (summary wording, run-tag source,
+  comment-id strategy, transport shape) are asserted explicitly so they stay
+  intentional instead of drifting apart unnoticed.
+- `e2e_test.py` drives a real Gitea instance. It creates a repository, seeds
+  a base branch, opens a pull request, runs the posting script against it
+  and then asserts on the state Gitea actually stored: the inline review
+  comment and its anchor, the summary conversation comment, the commit
+  status, that a second run updates the summary instead of duplicating it,
+  and that severity routing moves findings off the inline path.
+
+  ```bash
+  # Start a throwaway Gitea
+  docker run -d --name ocr-gitea-test -p 3111:3000 \
+    -e GITEA_I_AM_BEING_UNSAFE_RUNNING_AS_ROOT=true \
+    -e GITEA__database__DB_TYPE=sqlite3 \
+    -e GITEA__security__INSTALL_LOCK=true \
+    -e GITEA__server__ROOT_URL=http://localhost:3111/ \
+    gitea/gitea:latest
+
+  # Create a user and a token
+  docker exec ocr-gitea-test gitea admin user create \
+    --username ocrbot --password 'OcrPassw0rd123' \
+    --email ocrbot@example.com --admin --must-change-password=false
+  docker exec ocr-gitea-test gitea admin user generate-access-token \
+    --username ocrbot --token-name ocr-e2e --scopes all --raw
+
+  # Run the end-to-end test
+  cd examples/gitea_ci
+  python3 e2e_test.py --server http://127.0.0.1:3111 --token <token>
+
+  # Tear down
+  docker rm -f ocr-gitea-test
+  ```
