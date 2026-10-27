@@ -91,6 +91,33 @@ class NameValidationTests(unittest.TestCase):
         self.assertIsNotNone(sv.check_name_allowed("MY VAR"))
         self.assertIsNotNone(sv.check_name_allowed("MY-VAR"))
 
+    def test_reserved_prefix_is_case_insensitive(self):
+        self.assertIsNotNone(sv.check_name_allowed("gitea_token"))
+
+    def test_tokens_default_to_the_environment(self):
+        env = {"GITEA_API_TOKEN": "api", "OCR_LLM_AUTH_TOKEN": "llm",
+               "OCR_GITEA_TOKEN": "pat"}
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            args = sv.parse_args(["--server", "s", "--owner", "o", "--repo", "r"])
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual((args.token, args.llm_token, args.gitea_token),
+                         ("api", "llm", "pat"))
+
+    def test_missing_api_token_is_an_error(self):
+        saved = os.environ.pop("GITEA_API_TOKEN", None)
+        try:
+            self.assertEqual(sv.main(["--server", "s", "--owner", "o", "--repo", "r"]), 2)
+        finally:
+            if saved is not None:
+                os.environ["GITEA_API_TOKEN"] = saved
+
     def test_empty_name_is_rejected(self):
         self.assertIsNotNone(sv.check_name_allowed(""))
 
@@ -103,14 +130,12 @@ class NameValidationTests(unittest.TestCase):
 
 class SetVariableTests(unittest.TestCase):
 
-    def setUp(self):
-        sv.TOKEN_HOLDER[0] = "tok"
-
     def test_create_uses_post(self):
         opener = make_opener([FakeResponse(201)])
         message = sv.set_variable(opener, "http://g/api/v1", "o", "r",
-                                   "OCR_LLM_URL", "http://llm")
+                                   "OCR_LLM_URL", "http://llm", token="tok")
         self.assertIn("created", message)
+        self.assertEqual(opener.calls[0]["auth"], "token tok")
         self.assertEqual(opener.calls[0]["method"], "POST")
         self.assertEqual(opener.calls[0]["url"],
                          "http://g/api/v1/repos/o/r/actions/variables/OCR_LLM_URL")
@@ -149,9 +174,6 @@ class SetVariableTests(unittest.TestCase):
 
 
 class SetSecretTests(unittest.TestCase):
-
-    def setUp(self):
-        sv.TOKEN_HOLDER[0] = "tok"
 
     def test_create_and_update_both_use_put(self):
         opener = make_opener([FakeResponse(201)])
@@ -207,7 +229,7 @@ class BuildEntriesTests(unittest.TestCase):
         entries = sv.build_entries(self._args())
         stores = {name: store for store, name, _ in entries}
         self.assertEqual(stores["OCR_LLM_URL"], "variable")
-        self.assertEqual(stores["OCR_LLM_AUTH_TOKEN"], "variable")
+        self.assertEqual(stores["OCR_LLM_AUTH_TOKEN"], "secret")
         self.assertEqual(stores["OCR_GITEA_TOKEN"], "secret")
 
     def test_empty_values_are_skipped(self):
@@ -216,13 +238,11 @@ class BuildEntriesTests(unittest.TestCase):
         self.assertNotIn("OCR_LLM_MODEL", names)
         self.assertIn("OCR_LLM_URL", names)
 
-    def test_token_never_lands_in_the_variable_store(self):
+    def test_tokens_never_land_in_the_variable_store(self):
         entries = sv.build_entries(self._args())
         for store, name, value in entries:
-            if name == sv.GITEA_TOKEN_SECRET:
-                self.assertEqual(store, "secret")
-            else:
-                self.assertNotEqual(value, "pat")
+            if value in ("pat", "tok"):
+                self.assertEqual(store, "secret", name)
 
     def test_every_planned_name_is_legal(self):
         for store, name, _ in sv.build_entries(self._args()):
@@ -251,13 +271,17 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('${OCR_GITEA_TOKEN:-$GITEA_TOKEN}', self.workflow)
         self.assertNotIn("secrets.OCR_GITEA_TOKEN ||", self.workflow)
 
-    def test_llm_settings_are_read_from_the_variable_context(self):
-        # OCR_LLM_URL lives in the Variables store, so it must be read
-        # through ${{ vars.* }} and not through ${{ secrets.* }}.
-        self.assertIn("vars.OCR_LLM_URL", self.workflow)
-        self.assertIn("vars.OCR_LLM_AUTH_TOKEN", self.workflow)
-        self.assertNotIn("secrets.OCR_LLM_URL", self.workflow)
-        self.assertNotIn("secrets.OCR_LLM_AUTH_TOKEN", self.workflow)
+    def test_each_entry_is_read_from_its_own_store(self):
+        for name in sv.VARIABLE_NAMES:
+            self.assertNotIn("secrets.%s " % name, self.workflow)
+            self.assertNotIn("secrets.%s}" % name, self.workflow)
+        for name in sv.SECRET_NAMES:
+            self.assertIn("secrets.%s" % name, self.workflow)
+            self.assertNotIn("vars.%s" % name, self.workflow)
+
+    def test_every_documented_variable_is_wired(self):
+        for name in sv.VARIABLE_NAMES:
+            self.assertIn("vars.%s }}" % name, self.workflow)
 
     def test_readme_documents_the_two_stores_separately(self):
         self.assertIn("Settings", self.readme)

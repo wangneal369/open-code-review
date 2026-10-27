@@ -17,9 +17,12 @@
 #
 # Required CI/CD Variables (Settings -> Actions -> Variables):
 #   OCR_LLM_URL        - LLM API endpoint (e.g., https://api.openai.com/v1/chat/completions)
-#   OCR_LLM_AUTH_TOKEN - Authentication token for the LLM API
 #
 # Required CI/CD Secrets (Settings -> Actions -> Secrets):
+#   OCR_LLM_AUTH_TOKEN - Authentication token for the LLM API. It must be a
+#                        secret: variables are plain text and are handed to
+#                        fork pull requests, which run their own copy of
+#                        this workflow.
 #   OCR_GITEA_TOKEN    - Gitea access token used to post PR review comments
 #
 # Optional CI/CD Variables:
@@ -31,6 +34,10 @@
 #                        for OpenAI-compatible APIs
 #   OCR_BACKGROUND     - Business/requirement context passed to `ocr review`
 #   OCR_RULE           - Path to a custom rules JSON file
+#   OCR_LLM_AUTH_HEADER    - Custom auth header name
+#   OCR_LLM_EXTRA_HEADERS  - Extra headers "K=V,K=V"
+#   OCR_LLM_TIMEOUT        - LLM request timeout in seconds
+#   OCR_REVIEW_CONCURRENCY - Max concurrent file reviews (default: 8)
 #
 # Note on secret naming: Gitea refuses to store a secret whose name starts
 # with `GITEA_` or `GITHUB_`, so the access token is stored as
@@ -57,21 +64,24 @@ jobs:
           fetch-depth: 0
 
       - name: Install OpenCodeReview
+        env:
+          OCR_VERSION: ${{ vars.OCR_VERSION }}
         run: |
-          npm install -g @alibaba-group/open-code-review@${OCR_VERSION:-latest}
+          npm install -g "@alibaba-group/open-code-review@${OCR_VERSION:-latest}"
 
       - name: Configure OCR
         env:
-          # These live in the Variables store, so they are read through the
-          # `vars` context. A value placed in the Secrets store would not be
-          # visible here, and vice versa.
+          # Each value is read from the store it lives in; a value placed in
+          # one store is not visible through the other context.
           OCR_LLM_URL: ${{ vars.OCR_LLM_URL }}
-          OCR_LLM_AUTH_TOKEN: ${{ vars.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
           OCR_LLM_MODEL: ${{ vars.OCR_LLM_MODEL }}
           OCR_LLM_USE_ANTHROPIC: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          OCR_LLM_AUTH_HEADER: ${{ vars.OCR_LLM_AUTH_HEADER }}
+          OCR_LLM_EXTRA_HEADERS: ${{ vars.OCR_LLM_EXTRA_HEADERS }}
         run: |
           : "${OCR_LLM_URL:?set OCR_LLM_URL in Settings -> Actions -> Variables}"
-          : "${OCR_LLM_AUTH_TOKEN:?set OCR_LLM_AUTH_TOKEN in Settings -> Actions -> Variables}"
+          : "${OCR_LLM_AUTH_TOKEN:?set OCR_LLM_AUTH_TOKEN in Settings -> Actions -> Secrets}"
           ocr config set llm.url "$OCR_LLM_URL"
           ocr config set llm.auth_token "$OCR_LLM_AUTH_TOKEN"
           if [ -n "$OCR_LLM_MODEL" ]; then
@@ -82,6 +92,8 @@ jobs:
           else
             ocr config set llm.use_anthropic false
           fi
+          if [ -n "$OCR_LLM_AUTH_HEADER" ]; then ocr config set llm.auth_header "$OCR_LLM_AUTH_HEADER"; fi
+          if [ -n "$OCR_LLM_EXTRA_HEADERS" ]; then ocr config set llm.extra_headers "$OCR_LLM_EXTRA_HEADERS"; fi
           ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
 
       - name: Fetch the target branch
@@ -97,17 +109,23 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OCR_BACKGROUND: ${{ vars.OCR_BACKGROUND }}
           OCR_RULE: ${{ vars.OCR_RULE }}
+          OCR_LLM_TIMEOUT: ${{ vars.OCR_LLM_TIMEOUT }}
+          OCR_REVIEW_CONCURRENCY: ${{ vars.OCR_REVIEW_CONCURRENCY }}
+        shell: bash
         run: |
           mkdir -p .ocr
           # The head SHA (not the branch name) is used as the review target so
           # pull requests from forks are reviewed correctly.
-          ocr review \
-            --from "origin/${TARGET_BRANCH}" \
-            --to "${HEAD_SHA}" \
-            --format json \
-            --audience agent \
-            > .ocr/ocr-result.json || true
-          echo "OCR review completed."
+          ARGS=(--from "origin/${TARGET_BRANCH}" --to "${HEAD_SHA}"
+                --format json --audience agent)
+          if [ -n "$OCR_REVIEW_CONCURRENCY" ]; then ARGS+=(--concurrency "$OCR_REVIEW_CONCURRENCY"); fi
+          if [ -n "$OCR_BACKGROUND" ]; then ARGS+=(--background "$OCR_BACKGROUND"); fi
+          if [ -n "$OCR_RULE" ]; then ARGS+=(--rule "$OCR_RULE"); fi
+          # A failed review must not stop the job here: post_review.py posts
+          # the stderr log onto the PR, and the next step fails the job.
+          ocr review "${ARGS[@]}" > .ocr/ocr-result.json 2> .ocr/ocr-stderr.log \
+            || echo "OCR_EXIT_CODE=$?" >> "$GITHUB_ENV"
+          cat .ocr/ocr-stderr.log >&2
 
       - name: Post the review comments
         env:
@@ -115,6 +133,22 @@ jobs:
           GITEA_SERVER_URL: ${{ github.server_url }}
           GITEA_REPOSITORY: ${{ github.repository }}
           GITEA_PULL_REQUEST_INDEX: ${{ github.event.pull_request.number }}
+          # The commit that was reviewed; findings stay anchored to it even if
+          # the branch moves while the review runs.
+          OCR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Optional posting behavior; unset variables arrive empty and fall
+          # back to the script defaults.
+          OCR_STICKY_SUMMARY: ${{ vars.OCR_STICKY_SUMMARY }}
+          OCR_INCREMENTAL: ${{ vars.OCR_INCREMENTAL }}
+          OCR_INCREMENTAL_OVERLAP_THRESHOLD: ${{ vars.OCR_INCREMENTAL_OVERLAP_THRESHOLD }}
+          OCR_ROUTE_SEVERITY_BELOW: ${{ vars.OCR_ROUTE_SEVERITY_BELOW }}
+          OCR_ROUTE_CATEGORIES: ${{ vars.OCR_ROUTE_CATEGORIES }}
+          OCR_FAIL_ON_SEVERITY: ${{ vars.OCR_FAIL_ON_SEVERITY }}
+          OCR_RETRY_BASE_DELAY: ${{ vars.OCR_RETRY_BASE_DELAY }}
+          OCR_MAX_RETRIES: ${{ vars.OCR_MAX_RETRIES }}
+          OCR_MAX_RETRY_DELAY: ${{ vars.OCR_MAX_RETRY_DELAY }}
+          OCR_SUCCESS_DELAY: ${{ vars.OCR_SUCCESS_DELAY }}
+          OCR_FAILURE_DELAY: ${{ vars.OCR_FAILURE_DELAY }}
           # `OCR_GITEA_TOKEN` is the personal access token stored in the
           # Secrets store. Gitea injects its own job token as `GITEA_TOKEN`;
           # it is used as a fallback only, because the job token lacks the
@@ -126,3 +160,7 @@ jobs:
         run: |
           export GITEA_TOKEN="${OCR_GITEA_TOKEN:-$GITEA_TOKEN}"
           python3 post_review.py .ocr/ocr-result.json
+          if [ -n "$OCR_EXIT_CODE" ]; then
+            echo "ocr review exited with code ${OCR_EXIT_CODE}; see the PR summary for stderr."
+            exit 1
+          fi

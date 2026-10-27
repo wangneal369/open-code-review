@@ -370,12 +370,6 @@ class IdempotencyParityTests(unittest.TestCase):
         self.assertEqual(gitea.new_comment_id("1-2"), gitea.new_comment_id("1-2"))
         self.assertNotEqual(gitea.new_comment_id("0-0"), gitea.new_comment_id("1-2"))
 
-    def test_gitea_comment_id_is_reconcilable(self):
-        comment_id = gitea.new_comment_id("0-0")
-        body = gitea.format_comment(SAMPLE_COMMENTS[0], comment_id)
-        self.assertTrue(gitea.reconcile_posted_id(body, comment_id))
-        self.assertFalse(gitea.reconcile_posted_id(body, "other-id"))
-
     def test_gitlab_comment_id_is_unique(self):
         self.assertNotEqual(gitlab.new_comment_id("0-0"),
                             gitlab.new_comment_id("0-0"))
@@ -473,7 +467,7 @@ class PlatformDifferenceTests(unittest.TestCase):
 
     def test_comment_id_strategy_differs(self):
         # GitLab uses a random token per comment; Gitea derives a stable id
-        # so that a retried run can reconcile what it already posted.
+        # from the run, path and position.
         self.assertNotEqual(gitlab.new_comment_id("0-0"),
                             gitlab.new_comment_id("0-0"))
         self.assertEqual(gitea.new_comment_id("0-0"),

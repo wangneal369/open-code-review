@@ -47,7 +47,13 @@ store that matches the table below.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
+| `OCR_LLM_AUTH_TOKEN` | Yes | LLM API authentication token |
 | `OCR_GITEA_TOKEN` | Yes | Gitea access token used to post the review (scopes below) |
+
+> **Never store a token as a variable.** Variables are plain text, are not
+> masked in logs, and are handed to pull requests from forks — which run
+> their own, possibly edited, copy of the workflow. Secrets are withheld from
+> fork pull requests.
 
 > **Why not `GITEA_TOKEN`?** Gitea rejects any secret whose name starts with
 > `GITEA_` or `GITHUB_` (`400: name cannot start with 'GITEA_' or 'GITHUB_'`).
@@ -60,7 +66,6 @@ store that matches the table below.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OCR_LLM_URL` | Yes | LLM API endpoint URL (e.g. `https://api.openai.com/v1/chat/completions`) |
-| `OCR_LLM_AUTH_TOKEN` | Yes | API authentication token |
 | `OCR_LLM_MODEL` | No | Model name (e.g. `gpt-4o`) — OCR has no built-in default model and fails when this is unset |
 | `OCR_VERSION` | No | npm version spec for `@alibaba-group/open-code-review` (default: `latest`). Pin it (e.g. `1.9.0`) for reproducible reviews. |
 | `OCR_LLM_USE_ANTHROPIC` | No | `true` for the Anthropic API format, `false` (default) for OpenAI-compatible APIs |
@@ -83,14 +88,18 @@ The `setup_variables.py` helper in this directory creates every entry through
 the Gitea API, so the two stores cannot get mixed up:
 
 ```bash
+export GITEA_API_TOKEN=...      # token the helper authenticates with
+export OCR_LLM_AUTH_TOKEN=...   # stored as a secret
+export OCR_GITEA_TOKEN=...      # stored as a secret
 python3 setup_variables.py \
   --server http://gitea.example.com \
   --owner myorg --repo myrepo \
-  --token "$GITEA_PAT" \
-  --llm-url https://api.openai.com/v1/chat/completions \
-  --llm-token "$LLM_TOKEN" \
-  --gitea-token "$GITEA_PAT"
+  --llm-url https://api.openai.com/v1/chat/completions
 ```
+
+Tokens are read from the environment so they never appear in the process
+list or shell history; the `--token`, `--llm-token` and `--gitea-token` flags
+still override them.
 
 It is idempotent: existing entries are updated in place rather than
 duplicated. Run it with `--dry-run` first to print the planned changes
@@ -192,18 +201,17 @@ Additional behaviors (always on):
 - **Deterministic ordering**: comments are sorted by `path → start_line → end_line → original index` before posting, so identical reruns produce identical post sequences.
 - **Detailed warnings**: warnings are rendered as a bulleted list (`file (type): message`) rather than a bare count.
 - **Backtick-safe fences**: summary code blocks use a fence long enough to enclose any backticks in the code.
-- **Idempotency tags**: each inline comment carries an invisible HTML-comment id tag (`<!-- ocr-<hash> -->`) so a retry can be reconciled against what was actually posted.
+- **Idempotency tags**: each inline comment carries an invisible HTML-comment id tag (`<!-- ocr-<hash> -->`) that identifies it within the run.
 
 ### Retry and pacing settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OCR_RETRY_BASE_DELAY` | `2000` | Base delay (ms) for exponential backoff when a retryable error is hit |
-| `OCR_MAX_RETRIES` | `3` | Maximum retry attempts per request |
+| `OCR_MAX_RETRIES` | `3` | Maximum attempts per request. Reads are retried on network errors, 5xx and 429; writes only on 429, since a write that failed late may already have been applied. |
 | `OCR_MAX_RETRY_DELAY` | `60000` | Maximum delay (ms) for a single retry |
 | `OCR_SUCCESS_DELAY` | `2000` | Delay (ms) after a successful request to pace subsequent requests |
 | `OCR_FAILURE_DELAY` | `1000` | Delay (ms) after a non-retryable failure |
-| `OCR_RATE_LIMIT_THRESHOLD` | `10` | Proactively slow down when the server reports a low remaining quota |
 
 ### Use a specific OCR version
 
@@ -235,7 +243,7 @@ Common issues:
 1. **"error: missing required GITEA_SERVER_URL"** — the script could not resolve the PR context. It reads `GITEA_SERVER_URL`, `GITEA_REPOSITORY` and `GITEA_PULL_REQUEST_INDEX`; the workflow sets these from the GitHub-compatible context variables.
 2. **"Cannot find merge-base"** — the checkout was shallow. The workflow uses `fetch-depth: 0`; if you changed it, restore the full history.
 3. **A finding shows up in the summary instead of inline** — its line is not part of the pull request diff, so it cannot be anchored. The summary entry says so explicitly.
-4. **"Failed to parse OCR output"** — `OCR_LLM_URL` and `OCR_LLM_AUTH_TOKEN` are unset, or the review crashed. The OCR stderr log is included in the summary comment in that case.
+4. **"Failed to parse OCR output"** — `OCR_LLM_URL` and `OCR_LLM_AUTH_TOKEN` are unset, or the review crashed. The OCR stderr log (`.ocr/ocr-stderr.log`) is posted in the summary comment and the job fails.
 5. **The workflow cannot see a value you just added** — it was added to the wrong store. Variables are only readable through `${{ vars.NAME }}` and secrets only through `${{ secrets.NAME }}`; neither store is visible to the other. `setup_variables.py` writes each entry to the right one, and `setup_variables_test.py` asserts that the workflow, the README and the helper agree on the assignment.
 
 ## Testing

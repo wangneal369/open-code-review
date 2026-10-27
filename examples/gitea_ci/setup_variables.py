@@ -36,13 +36,12 @@ as ``OCR_GITEA_TOKEN``.
 
 Usage::
 
+    # Tokens come from the environment, not the command line.
+    export GITEA_API_TOKEN=... OCR_LLM_AUTH_TOKEN=... OCR_GITEA_TOKEN=...
     python3 setup_variables.py \\
         --server http://gitea.example.com \\
         --owner myorg --repo myrepo \\
-        --token "$GITEA_PAT" \\
-        --llm-url https://api.openai.com/v1/chat/completions \\
-        --llm-token "$LLM_TOKEN" \\
-        --gitea-token "$GITEA_PAT"
+        --llm-url https://api.openai.com/v1/chat/completions
 
 The script is idempotent: existing entries are updated in place instead of
 being duplicated. Pass ``--dry-run`` to print the planned changes without
@@ -64,7 +63,6 @@ GITEA_TOKEN_SECRET = "OCR_GITEA_TOKEN"
 # Entries written to the Variables store (readable via ${{ vars.NAME }}).
 VARIABLE_NAMES = (
     "OCR_LLM_URL",
-    "OCR_LLM_AUTH_TOKEN",
     "OCR_LLM_MODEL",
     "OCR_VERSION",
     "OCR_LLM_USE_ANTHROPIC",
@@ -77,7 +75,10 @@ VARIABLE_NAMES = (
 )
 
 # Entries written to the Secrets store (readable via ${{ secrets.NAME }}).
+# Credentials must never be variables: those are plain text and are handed
+# to fork pull requests, which run their own copy of the workflow.
 SECRET_NAMES = (
+    "OCR_LLM_AUTH_TOKEN",
     GITEA_TOKEN_SECRET,
 )
 
@@ -128,8 +129,9 @@ def _error_message(body):
 
 def check_name_allowed(name):
     """Return an error message when Gitea would reject ``name``."""
+    # Gitea upper-cases names before checking them, so "gitea_x" is reserved too.
     for prefix in RESERVED_PREFIXES:
-        if name.startswith(prefix):
+        if name.upper().startswith(prefix):
             return ("name cannot start with %r -- pick another name" % prefix)
     if not name or not (name[0].isalpha() or name[0] == "_"):
         return "name must start with a letter or an underscore"
@@ -139,7 +141,7 @@ def check_name_allowed(name):
     return None
 
 
-def set_variable(opener, base_url, owner, repo, name, value, dry_run=False):
+def set_variable(opener, base_url, owner, repo, name, value, dry_run=False, token=""):
     """Create or update one variable. Returns the action that was taken."""
     problem = check_name_allowed(name)
     if problem:
@@ -147,11 +149,11 @@ def set_variable(opener, base_url, owner, repo, name, value, dry_run=False):
     url = "%s/repos/%s/%s/actions/variables/%s" % (base_url, owner, repo, name)
     if dry_run:
         return "would set variable %s" % name
-    status, body = _request(opener, "POST", url, TOKEN_HOLDER[0], {"value": value})
+    status, body = _request(opener, "POST", url, token, {"value": value})
     if status == 201:
         return "created variable %s" % name
     if status == 409:
-        status, body = _request(opener, "PUT", url, TOKEN_HOLDER[0], {"value": value})
+        status, body = _request(opener, "PUT", url, token, {"value": value})
         if status == 204:
             return "updated variable %s" % name
         raise SetupError(
@@ -160,7 +162,7 @@ def set_variable(opener, base_url, owner, repo, name, value, dry_run=False):
         "could not create variable %s: %s" % (name, _error_message(body)))
 
 
-def set_secret(opener, base_url, owner, repo, name, value, dry_run=False):
+def set_secret(opener, base_url, owner, repo, name, value, dry_run=False, token=""):
     """Create or update one secret. Returns the action that was taken."""
     problem = check_name_allowed(name)
     if problem:
@@ -168,21 +170,16 @@ def set_secret(opener, base_url, owner, repo, name, value, dry_run=False):
     url = "%s/repos/%s/%s/actions/secrets/%s" % (base_url, owner, repo, name)
     if dry_run:
         return "would set secret %s" % name
-    status, body = _request(opener, "PUT", url, TOKEN_HOLDER[0], {"data": value})
+    status, body = _request(opener, "PUT", url, token, {"data": value})
     if status in (201, 204):
         return "%s secret %s" % ("created" if status == 201 else "updated", name)
     raise SetupError("could not set secret %s: %s" % (name, _error_message(body)))
 
 
-# The token is threaded through the helpers above as a module-level holder so
-# their signatures stay small and easy to unit test.
-TOKEN_HOLDER = [""]
-
-
 def build_entries(args):
     """Build the ordered list of (store, name, value) entries to write."""
     entries = []
-    optional = {
+    values = {
         "OCR_LLM_URL": args.llm_url,
         "OCR_LLM_AUTH_TOKEN": args.llm_token,
         "OCR_LLM_MODEL": args.llm_model,
@@ -194,13 +191,12 @@ def build_entries(args):
         "OCR_LLM_EXTRA_HEADERS": args.llm_extra_headers,
         "OCR_LLM_TIMEOUT": args.llm_timeout,
         "OCR_REVIEW_CONCURRENCY": args.review_concurrency,
+        GITEA_TOKEN_SECRET: args.gitea_token,
     }
-    for name in VARIABLE_NAMES:
-        value = optional.get(name)
-        if value:
-            entries.append(("variable", name, value))
-    if args.gitea_token:
-        entries.append(("secret", GITEA_TOKEN_SECRET, args.gitea_token))
+    for store, names in (("variable", VARIABLE_NAMES), ("secret", SECRET_NAMES)):
+        for name in names:
+            if values.get(name):
+                entries.append((store, name, values[name]))
     return entries
 
 
@@ -212,12 +208,16 @@ def parse_args(argv=None):
                         help="Gitea instance URL, e.g. http://gitea.example.com")
     parser.add_argument("--owner", required=True, help="Repository owner")
     parser.add_argument("--repo", required=True, help="Repository name")
-    parser.add_argument("--token", required=True,
-                        help="API token used to authenticate the calls")
+    # Tokens default to environment variables so they need not appear on the
+    # command line, where the process list and shell history keep them.
+    parser.add_argument("--token", default=os.environ.get("GITEA_API_TOKEN", ""),
+                        help="API token used to authenticate the calls "
+                             "(default: $GITEA_API_TOKEN)")
     parser.add_argument("--llm-url", default="",
                         help="LLM API endpoint (variable OCR_LLM_URL)")
-    parser.add_argument("--llm-token", default="",
-                        help="LLM API token (variable OCR_LLM_AUTH_TOKEN)")
+    parser.add_argument("--llm-token", default=os.environ.get("OCR_LLM_AUTH_TOKEN", ""),
+                        help="LLM API token (secret OCR_LLM_AUTH_TOKEN; "
+                             "default: $OCR_LLM_AUTH_TOKEN)")
     parser.add_argument("--llm-model", default="",
                         help="Model name (variable OCR_LLM_MODEL)")
     parser.add_argument("--llm-use-anthropic", default="",
@@ -236,8 +236,9 @@ def parse_args(argv=None):
                         help="Path to a custom rules JSON file")
     parser.add_argument("--review-concurrency", default="",
                         help="Max concurrent file reviews")
-    parser.add_argument("--gitea-token", default="",
-                        help="Gitea access token (secret %s)" % GITEA_TOKEN_SECRET)
+    parser.add_argument("--gitea-token", default=os.environ.get(GITEA_TOKEN_SECRET, ""),
+                        help="Gitea access token (secret %s; default: $%s)"
+                             % (GITEA_TOKEN_SECRET, GITEA_TOKEN_SECRET))
     parser.add_argument("--dry-run", action="store_true",
                         help="print the planned changes without applying them")
     return parser.parse_args(argv)
@@ -245,8 +246,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if not args.token and not args.dry_run:
+        print("ERROR: pass --token or set GITEA_API_TOKEN", file=sys.stderr)
+        return 2
     base_url = "%s/api/v1" % args.server.rstrip("/")
-    TOKEN_HOLDER[0] = args.token
     opener = _build_opener()
 
     entries = build_entries(args)
@@ -259,10 +262,10 @@ def main(argv=None):
         try:
             if store == "variable":
                 message = set_variable(opener, base_url, args.owner, args.repo,
-                                       name, value, args.dry_run)
+                                       name, value, args.dry_run, args.token)
             else:
                 message = set_secret(opener, base_url, args.owner, args.repo,
-                                     name, value, args.dry_run)
+                                     name, value, args.dry_run, args.token)
         except SetupError as error:
             print("ERROR: %s" % error, file=sys.stderr)
             failures += 1

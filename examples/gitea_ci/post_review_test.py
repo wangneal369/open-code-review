@@ -134,6 +134,11 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("```suggestion", body)
         self.assertIn("fixed()", body)
 
+    def test_suggestion_with_backticks_gets_a_longer_fence(self):
+        body = pr.format_comment({"content": "c", "existing_code": "x",
+                                   "suggestion_code": "s = '```'"})
+        self.assertIn("````suggestion\ns = '```'\n````", body)
+
     def test_format_comment_fallback_includes_path_and_reason(self):
         md = pr.format_comment_fallback({"path": "a.go", "content": "c",
                                           "start_line": 3, "end_line": 5},
@@ -541,11 +546,6 @@ class IdempotencyTests(unittest.TestCase):
         b = pr.new_comment_id("run-2:src/a.go:1:0")
         self.assertNotEqual(a, b)
 
-    def test_reconcile_detects_posted_id(self):
-        self.assertTrue(pr.reconcile_posted_id("<!-- ocr-abc --> text", "ocr-abc"))
-        self.assertFalse(pr.reconcile_posted_id("other text", "ocr-abc"))
-        self.assertFalse(pr.reconcile_posted_id("<!-- ocr-abc -->", None))
-
 
 class ConfigTests(unittest.TestCase):
     def test_defaults(self):
@@ -565,6 +565,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(pr.resolve_threshold("0.8"), 0.8)
         self.assertEqual(pr.resolve_threshold("bogus"), pr.DEFAULT_OVERLAP_THRESHOLD)
         self.assertEqual(pr.resolve_threshold("2"), pr.DEFAULT_OVERLAP_THRESHOLD)
+
+    def test_empty_or_malformed_integers_use_defaults(self):
+        config = pr.build_config({"OCR_SUCCESS_DELAY": "", "OCR_MAX_RETRIES": "3x"})
+        self.assertEqual(config["success_delay"], 2.0)
+        self.assertEqual(config["max_retries"], 3)
 
     def test_run_tag_from_env(self):
         self.assertIn("GITHUB_RUN_ID", pr.run_tag_from_env({"GITHUB_RUN_ID": "42"}))
@@ -631,6 +636,140 @@ class StatsFileTests(unittest.TestCase):
         self.assertIn("OCR_COMMENTS_TOTAL=3", content)
         self.assertIn("OCR_COMMENTS_INLINE=2", content)
         self.assertIn("OCR_SUMMARY_URL=http://s", content)
+
+
+class DiffHeaderEdgeTests(unittest.TestCase):
+    def test_quoted_non_ascii_path_is_unquoted(self):
+        patch = ('diff --git "a/\\344\\270\\255.go" "b/\\344\\270\\255.go"\n'
+                 '--- "a/\\344\\270\\255.go"\n'
+                 '+++ "b/\\344\\270\\255.go"\n'
+                 "@@ -1,0 +1,1 @@\n"
+                 "+x\n")
+        inventory = pr.parse_diff_hunk_inventory(patch)
+        self.assertEqual(list(inventory), ["\u4e2d.go"])
+
+    def test_path_with_spaces(self):
+        patch = ("diff --git a/my dir/f.go b/my dir/f.go\n"
+                 "@@ -0,0 +1,1 @@\n"
+                 "+x\n")
+        self.assertIn("my dir/f.go", pr.parse_diff_hunk_inventory(patch))
+
+    def test_header_lookalikes_inside_a_hunk_are_content(self):
+        patch = ("diff --git a/a.sql b/a.sql\n"
+                 "--- a/a.sql\n"
+                 "+++ b/a.sql\n"
+                 "@@ -1,2 +1,2 @@\n"
+                 "--- old comment\n"
+                 "+++ new comment\n"
+                 " tail\n")
+        inventory = pr.parse_diff_hunk_inventory(patch)
+        self.assertEqual(list(inventory), ["a.sql"])
+        self.assertEqual(inventory["a.sql"]["new"], {1: "added", 2: "context"})
+        self.assertEqual(inventory["a.sql"]["old"], {2: "context"})
+
+
+class RetryTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.responses = []
+        self._orig = pr._api_request_once
+        pr._api_request_once = self._fake
+
+    def tearDown(self):
+        pr._api_request_once = self._orig
+
+    def _fake(self, api_base, token, endpoint, data=None, method="GET", expect_text=False):
+        self.calls.append(method)
+        return self.responses.pop(0)
+
+    def _run(self, method, statuses, **config):
+        self.responses = [{"success": 200 <= s < 300, "status": s, "headers": {}} for s in statuses]
+        return pr._api_request_with_retry("http://x", "t", "/e", method=method,
+                                          config=dict({"retry_base_delay": 0,
+                                                       "max_retry_delay": 0}, **config),
+                                          sleep=no_sleep)
+
+    def test_get_retries_server_errors(self):
+        self.assertTrue(self._run("GET", [500, 0, 200])["success"])
+        self.assertEqual(len(self.calls), 3)
+
+    def test_write_is_not_repeated_after_an_ambiguous_failure(self):
+        for status in (0, 500, 502):
+            self.calls = []
+            self.assertFalse(self._run("POST", [status, 200])["success"])
+            self.assertEqual(len(self.calls), 1, status)
+
+    def test_write_is_retried_on_429(self):
+        self.assertTrue(self._run("POST", [429, 201])["success"])
+
+    def test_max_retries_is_honored(self):
+        self._run("GET", [500, 500, 500, 500, 500], max_retries=5)
+        self.assertEqual(len(self.calls), 5)
+
+
+class PaginationTests(unittest.TestCase):
+    def _poster(self, pages):
+        poster = pr.GiteaPoster("http://p", "http://i", "t", {})
+        poster.requested = []
+
+        def fake_retry(base, endpoint, data=None, method="GET"):
+            poster.requested.append(endpoint)
+            page = int(endpoint.rsplit("page=", 1)[1])
+            return {"success": True, "data": pages(page)}
+        poster._retry = fake_retry
+        return poster
+
+    def test_reads_every_page(self):
+        data = {1: [{"id": 1}, {"id": 2}], 2: [{"id": 3}]}
+        poster = self._poster(lambda page: data.get(page, []))
+        self.assertEqual([c["id"] for c in poster.list_comments()], [1, 2, 3])
+
+    def test_endpoint_that_ignores_paging_stops_after_one_repeat(self):
+        poster = self._poster(lambda page: [{"id": 1}, {"id": 2}])
+        self.assertEqual(len(poster.list_reviews()), 2)
+        self.assertEqual(len(poster.requested), 2)
+
+    def test_failed_page_fails_the_listing(self):
+        poster = pr.GiteaPoster("http://p", "http://i", "t", {})
+        poster._retry = lambda *a, **k: {"success": False}
+        self.assertIsNone(poster.list_comments())
+
+
+class StaleHeadTests(unittest.TestCase):
+    """A push during the review hands the post over to the newer run."""
+
+    def _main(self, current_head):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        result = os.path.join(tmp, "r.json")
+        with open(result, "w") as f:
+            f.write('{"comments": [{"path": "a.go", "end_line": 1, "content": "c"}]}')
+        env = {"GITEA_SERVER_URL": "http://g", "GITEA_REPOSITORY": "o/r",
+               "GITEA_PULL_REQUEST_INDEX": "1", "GITEA_TOKEN": "t",
+               "OCR_HEAD_SHA": "reviewed"}
+        saved = dict(os.environ)
+        orig = (pr.fetch_pull_request, pr.fetch_pr_diff, pr.publish, pr.post_commit_status)
+        self.published = []
+        pr.fetch_pull_request = lambda *a: {"head_sha": current_head}
+        pr.fetch_pr_diff = lambda *a: PATCH
+        pr.publish = lambda result, refs, *a, **k: self.published.append(refs) or dict(pr.ZERO_STATS)
+        pr.post_commit_status = lambda *a, **k: True
+        os.environ.update(env)
+        try:
+            return pr.main([result, "--stats-file", os.path.join(tmp, "s.env")])
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            (pr.fetch_pull_request, pr.fetch_pr_diff, pr.publish,
+             pr.post_commit_status) = orig
+
+    def test_moved_head_skips_posting(self):
+        self.assertEqual(self._main("newer"), 0)
+        self.assertEqual(self.published, [])
+
+    def test_unmoved_head_posts_against_the_reviewed_commit(self):
+        self._main("reviewed")
+        self.assertEqual(self.published[0]["head_sha"], "reviewed")
 
 
 if __name__ == "__main__":

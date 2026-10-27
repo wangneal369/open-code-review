@@ -47,13 +47,15 @@ Behaviors aligned with the GitLab example:
   - detailed warning rendering,
   - sticky summary (update-in-place across runs),
   - incremental mode (skip comments overlapping prior bot reviews),
-  - idempotent retry (per-comment id tag; reconcile before retrying),
+  - no duplicate posts (writes are retried only on 429, which the server
+    rejects before acting),
   - dotenv stats output and optional severity-based job gating.
 
 Standard library only (json, urllib) so it runs on any stock python3 image.
 """
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
@@ -134,6 +136,11 @@ MAX_COMMENTS_PER_REVIEW = 20
 
 # Number of attempts for transport failures that are safe to retry.
 MAX_ATTEMPTS = 3
+
+# Page size for list endpoints, and a hard stop against a server that never
+# returns an empty page.
+LIST_PAGE_SIZE = 50
+MAX_LIST_PAGES = 100
 
 # Injectable so tests can run without real delays; production uses time.sleep.
 _sleep = time.sleep
@@ -256,10 +263,11 @@ def fenced_block(content, language=""):
 def format_comment(comment, comment_id=None):
     """Assemble the visible inline-review-comment body.
 
-    The per-comment id tag (when provided) is prepended as an HTML comment so
-    :func:`reconcile_posted_id` can match it back on retry. The category/severity
-    badge is then prepended on its own line. Gitea renders Markdown in review
-    comments, so a fenced ``suggestion`` block is used for the proposed change.
+    The per-comment id tag (when provided) is prepended as an HTML comment,
+    which also marks the comment as the bot's for incremental mode. The
+    category/severity badge is then prepended on its own line. Gitea has no
+    "apply suggestion" feature, so the ``suggestion`` block is only a labelled
+    code block; :func:`fenced_block` keeps code containing backticks intact.
     """
     body = ""
     if comment_id:
@@ -272,7 +280,7 @@ def format_comment(comment, comment_id=None):
     existing = comment.get("existing_code", "")
     if suggestion and existing:
         body += "\n\n**Suggestion:**\n"
-        body += "```suggestion\n%s\n```" % suggestion
+        body += fenced_block(suggestion, "suggestion")
     return body
 
 
@@ -455,6 +463,36 @@ def overlaps_history(comment, cur_span, history, threshold):
 # Diff inventory (pure)
 # --------------------------------------------------------------------------- #
 
+def _unquote_git_path(path):
+    """Undo git's C-style quoting of paths with non-ASCII or special bytes.
+
+    Without core.quotepath=false git writes ``"b/\\344\\270\\255.go"`` for a
+    non-ASCII name, which would never match the plain path in a finding.
+    """
+    if len(path) < 2 or path[0] != '"' or path[-1] != '"':
+        return path
+    raw = codecs.escape_decode(path[1:-1].encode("utf-8"))[0]
+    return raw.decode("utf-8", "replace")
+
+
+def _new_path_from_diff_header(line):
+    """Extract the b-side path from ``diff --git a/<old> b/<new>``.
+
+    Splitting on spaces breaks paths that contain spaces, so the b-side is
+    located from the right instead.
+    """
+    rest = line[len("diff --git "):]
+    if rest.endswith('"'):
+        idx = rest.rfind(' "b/')
+        new_part = _unquote_git_path(rest[idx + 1:]) if idx >= 0 else ""
+    else:
+        idx = rest.rfind(" b/")
+        new_part = rest[idx + 1:] if idx >= 0 else ""
+    if new_part.startswith("b/"):
+        return new_part[2:]
+    return None
+
+
 def parse_diff_hunk_inventory(patch):
     """Parse a unified diff into ``{path: {"new": {line: kind}, "old": {...}}}``.
 
@@ -492,27 +530,23 @@ def parse_diff_hunk_inventory(patch):
     for line in str(patch or "").splitlines():
         if line.startswith("diff --git "):
             flush()
-            current = {"path": None, "new": {}, "old": {}}
-            # "diff --git a/x b/y" - the new path is the b-side.
-            parts = line.split(" ")
-            if len(parts) >= 4:
-                new_part = parts[3]
-                if new_part.startswith("b/"):
-                    new_part = new_part[2:]
-                current["path"] = new_part
+            current = {"path": _new_path_from_diff_header(line), "new": {}, "old": {}}
             new_ln = 0
             old_ln = 0
             continue
         if current is None:
             continue
-        if line.startswith("+++ "):
-            target = line[4:].strip()
+        # File headers only precede the first hunk. Inside a hunk, "+++ x" is
+        # an added line whose content starts with "++ ".
+        in_hunk = "hunk_new_count" in current
+        if not in_hunk and line.startswith("+++ "):
+            target = _unquote_git_path(line[4:].rstrip("\t\r"))
             if target == "/dev/null":
                 current["path"] = current["path"] or ""
             elif target.startswith("b/"):
                 current["path"] = target[2:]
             continue
-        if line.startswith("--- "):
+        if not in_hunk and line.startswith("--- "):
             continue
         if line.startswith("@@"):
             m = re.match(r"^@@ -(\d+)(?:,(\d+)?)? \+(\d+)(?:,(\d+)?)? @@", line)
@@ -615,18 +649,11 @@ def validate_comment_against_diff(comment, inventory):
 def new_comment_id(run_tag):
     """Build a deterministic per-comment id tag for a run.
 
-    The tag embeds the run identity so a retry of the same run produces the
-    same id, which is what makes reconciliation possible.
+    The tag embeds the run identity so a rerun of the same run produces the
+    same id.
     """
     digest = hashlib.sha1(str(run_tag).encode("utf-8")).hexdigest()[:12]
     return "ocr-%s" % digest
-
-
-def reconcile_posted_id(body, comment_id):
-    """True when ``body`` already carries the given comment id tag."""
-    if not comment_id:
-        return False
-    return ("<!-- %s -->" % comment_id) in (body or "")
 
 
 def run_tag_from_env(env):
@@ -736,13 +763,17 @@ def _api_request_with_retry(api_base, token, endpoint, data=None, method="GET",
                             config=None, sleep=_sleep, expect_text=False):
     """Retry transient failures with exponential backoff.
 
-    Only failures that are safe to retry are retried: network errors, 5xx and
-    429. A 4xx (other than 429) is a client error and is returned as-is.
+    Only failures that are safe to retry are retried. A 429 is always safe:
+    the server refused the request before acting on it. Network errors and
+    5xx are retried for GET only, because a write that timed out or failed
+    late may already have been applied, and repeating it would post a
+    duplicate review or comment.
     """
     config = config or {}
+    max_attempts = max(1, int(config.get("max_retries") or MAX_ATTEMPTS))
     attempt = 0
     last = None
-    while attempt < MAX_ATTEMPTS:
+    while attempt < max_attempts:
         attempt += 1
         resp = _api_request_once(api_base, token, endpoint, data=data, method=method,
                                   expect_text=expect_text)
@@ -750,8 +781,9 @@ def _api_request_with_retry(api_base, token, endpoint, data=None, method="GET",
         status = resp.get("status")
         if resp.get("success"):
             return resp
-        if status == 429 or status == 0 or (status is not None and status >= 500):
-            if attempt >= MAX_ATTEMPTS:
+        transient = status == 0 or (status is not None and status >= 500)
+        if status == 429 or (transient and method == "GET"):
+            if attempt >= max_attempts:
                 break
             delay = _compute_retry_delay(attempt, config, resp.get("headers"))
             log("[retry] %s %s failed (HTTP %s); retrying in %.1fs"
@@ -816,13 +848,31 @@ class GiteaPoster:
                                        data=data, method=method,
                                        config=self.config)
 
+    def _list_all(self, base, endpoint):
+        """GET every page of a list endpoint; None when any page fails.
+
+        A partial list would hide the sticky summary or prior findings and
+        cause duplicates, so a failed page fails the whole listing.
+        """
+        items = []
+        seen = set()
+        for page in range(1, MAX_LIST_PAGES + 1):
+            resp = self._retry(base, "%s?limit=%d&page=%d" % (endpoint, LIST_PAGE_SIZE, page))
+            if not resp.get("success"):
+                return None
+            fresh = [it for it in (resp.get("data") or []) if it.get("id") not in seen]
+            # Some endpoints ignore paging and return everything on every
+            # page, and the server may cap limit below what was asked, so a
+            # page with nothing new is the only reliable end marker.
+            if not fresh:
+                break
+            seen.update(it.get("id") for it in fresh)
+            items.extend(fresh)
+        return items
+
     def list_comments(self):
         """List the conversation comments of the pull request."""
-        resp = self._retry(self.issue_base, "/comments?limit=50")
-        if not resp.get("success"):
-            log("[summary] cannot list comments for upsert; skipping to avoid duplicate.")
-            return None
-        return resp.get("data") or []
+        return self._list_all(self.issue_base, "/comments")
 
     def create_comment(self, body):
         """Create a conversation comment (used for the sticky summary)."""
@@ -847,17 +897,11 @@ class GiteaPoster:
 
     def list_reviews(self):
         """List the reviews of the pull request."""
-        resp = self._retry(self.pull_base, "/reviews?limit=50")
-        if not resp.get("success"):
-            return None
-        return resp.get("data") or []
+        return self._list_all(self.pull_base, "/reviews")
 
     def list_review_comments(self, review_id):
         """List the inline comments of one review."""
-        resp = self._retry(self.pull_base, "/reviews/%s/comments" % review_id)
-        if not resp.get("success"):
-            return None
-        return resp.get("data") or []
+        return self._list_all(self.pull_base, "/reviews/%s/comments" % review_id)
 
     def create_review(self, body, comments, commit_id, event="COMMENT"):
         """Create one review carrying all its inline comments.
@@ -910,10 +954,6 @@ class DryRunPoster:
                 "comments_count": len(comments or [])}
 
 
-def make_poster(pull_base, issue_base, token, config):
-    return GiteaPoster(pull_base, issue_base, token, config)
-
-
 # --------------------------------------------------------------------------- #
 # Summary helpers
 # --------------------------------------------------------------------------- #
@@ -950,11 +990,6 @@ def upsert_summary(poster, body, sticky, tag=None):
         return (resp or {}).get("url") or existing.get("html_url")
     resp = poster.create_comment(body)
     return (resp or {}).get("url")
-
-
-def ensure_summary_anchor(poster, body, sticky, tag=None):
-    """Create the summary comment used as the anchor for the run."""
-    return upsert_summary(poster, body, sticky, tag=tag)
 
 
 def load_incremental_history(poster):
@@ -1092,8 +1127,8 @@ def publish(result, diff_refs, poster, config, sleep=_sleep):
         build_pre_review_summary_body(stats["total"], no_line + unverifiable, routed, warnings),
         run_tag,
     )
-    ensure_summary_anchor(poster, anchor_body, sticky,
-                          tag=summary_tag_for(run_tag))
+    upsert_summary(poster, anchor_body, sticky,
+                   tag=summary_tag_for(run_tag))
 
     # Post inline comments. Gitea applies a review atomically, so the batch is
     # validated against the diff beforehand and only then submitted.
@@ -1156,20 +1191,33 @@ def _build_review_body(count):
 # Config + stats
 # --------------------------------------------------------------------------- #
 
+def _env_int(env, key, default):
+    """Read an integer setting; empty or malformed values use the default.
+
+    The workflow forwards unset Gitea variables as empty strings, so "" must
+    mean "not configured" rather than crash the posting step.
+    """
+    try:
+        return int(env.get(key) or default)
+    except ValueError:
+        log("[warn] ignoring non-integer %s=%r; using %d" % (key, env.get(key), default))
+        return default
+
+
 def build_config(env):
     """Build the config dict from environment variables (with defaults)."""
     return {
         # Pacing (used by publish).
-        "success_delay": int(env.get("OCR_SUCCESS_DELAY", "2000")) / 1000,
-        "failure_delay": int(env.get("OCR_FAILURE_DELAY", "1000")) / 1000,
-        "rate_limit_threshold": int(env.get("OCR_RATE_LIMIT_THRESHOLD", "10")),
+        "success_delay": _env_int(env, "OCR_SUCCESS_DELAY", 2000) / 1000,
+        "failure_delay": _env_int(env, "OCR_FAILURE_DELAY", 1000) / 1000,
+        "rate_limit_threshold": _env_int(env, "OCR_RATE_LIMIT_THRESHOLD", 10),
         # Read-API pacing.
-        "read_success_delay": int(env.get("OCR_READ_SUCCESS_DELAY", "500")) / 1000,
-        "read_low_remaining_spacing": int(env.get("OCR_READ_LOW_REMAINING_SPACING", "5000")) / 1000,
-        # Retry (used by make_poster / fetch_pull_request).
-        "retry_base_delay": int(env.get("OCR_RETRY_BASE_DELAY", "2000")) / 1000,
-        "max_retries": int(env.get("OCR_MAX_RETRIES", "3")),
-        "max_retry_delay": int(env.get("OCR_MAX_RETRY_DELAY", "60000")) / 1000,
+        "read_success_delay": _env_int(env, "OCR_READ_SUCCESS_DELAY", 500) / 1000,
+        "read_low_remaining_spacing": _env_int(env, "OCR_READ_LOW_REMAINING_SPACING", 5000) / 1000,
+        # Retry (used by every API call).
+        "retry_base_delay": _env_int(env, "OCR_RETRY_BASE_DELAY", 2000) / 1000,
+        "max_retries": _env_int(env, "OCR_MAX_RETRIES", 3),
+        "max_retry_delay": _env_int(env, "OCR_MAX_RETRY_DELAY", 60000) / 1000,
         # Base delay for transient server errors. Gitea has no rate-limit
         # headers to honour, so this is the only escalation path; the key is
         # kept for parity with the other platform examples.
@@ -1358,7 +1406,7 @@ def main(argv=None):
         except FileNotFoundError:
             pass
         if stderr_content:
-            poster = make_poster(pull_base, issue_base, api_token, config)
+            poster = GiteaPoster(pull_base, issue_base, api_token, config)
             run_tag = config.get("run_tag", "0-0")
             body = wrap_summary_body(
                 "⚠️ **OpenCodeReview** encountered an error:\n%s" % fenced_block(stderr_content),
@@ -1374,15 +1422,25 @@ def main(argv=None):
         poster = DryRunPoster()
         diff_refs = {"head_sha": "(dry)", "base_sha": "(dry)", "inventory": {}}
     else:
-        poster = make_poster(pull_base, issue_base, api_token, config)
+        poster = GiteaPoster(pull_base, issue_base, api_token, config)
         pr = fetch_pull_request(pull_base, api_token, config) or {}
+        reviewed_sha = env.get("OCR_HEAD_SHA")
+        if reviewed_sha and pr.get("head_sha") and pr["head_sha"] != reviewed_sha:
+            # The push that moved the head triggered its own run, which reviews
+            # the new code. These findings target superseded lines, and the
+            # PR diff no longer matches them, so posting would only add noise.
+            log("Pull request head moved from %s to %s during the review; "
+                "skipping the post in favor of the newer run."
+                % (reviewed_sha, pr["head_sha"]))
+            write_stats_file(args.stats_file, ZERO_STATS)
+            return 0
         patch = fetch_pr_diff(pull_base, api_token, config)
         inventory = parse_diff_hunk_inventory(patch) if patch else None
         if inventory is None:
-            log("Warning: Could not fetch the pull request diff. "
-                "Inline comments cannot be validated and will be skipped.")
-        diff_refs = {"head_sha": pr.get("head_sha"), "base_sha": pr.get("base_sha"),
-                     "inventory": inventory}
+            log("Warning: Could not fetch the pull request diff. Inline comments "
+                "are posted unvalidated; one bad line fails its whole batch.")
+        diff_refs = {"head_sha": reviewed_sha or pr.get("head_sha"),
+                     "base_sha": pr.get("base_sha"), "inventory": inventory}
 
     stats = publish(result, diff_refs, poster, config, sleep=_sleep)
     write_stats_file(args.stats_file, stats)
@@ -1398,7 +1456,7 @@ def main(argv=None):
         stats["total"], stats["inline"], stats["summary"])
     post_commit_status(repo_base, api_token, diff_refs.get("head_sha"), state,
                         description=description,
-                        context=env.get("OCR_STATUS_CONTEXT", "open-code-review"),
+                        context=env.get("OCR_STATUS_CONTEXT") or "open-code-review",
                         target_url=env.get("OCR_STATUS_TARGET_URL", ""),
                         config=config)
 
