@@ -11,7 +11,7 @@ PR Opened/Updated -> Gitea Actions triggered -> OCR reviews the diff -> Review p
 ```
 
 1. When a pull request is opened or updated, the Gitea Actions workflow is triggered
-2. It installs OCR via npm in a `node:20` Docker image
+2. It installs OCR via npm in the runner job image, which needs node 20+, python3 and git 2.41+ (e.g. `node:20-trixie`; `node:20-bookworm` ships git 2.39, which is too old)
 3. Runs `ocr review --from origin/<target> --to <head_sha> --format json --audience agent` to analyze the diff (the head SHA is used so pull requests from forks are reviewed correctly)
 4. Parses the JSON output and posts the findings on the PR using Gitea's Pull Request Review API
 

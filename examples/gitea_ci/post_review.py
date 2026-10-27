@@ -1361,6 +1361,32 @@ def _resolve_ci_context(env):
     return server_url, owner, repo, pr_index
 
 
+def report_review_error(args, env, config, pull_base, issue_base, repo_base,
+                        api_token, message):
+    """Post the failed review's message and stderr, and mark the check failed."""
+    stderr_content = ""
+    try:
+        with open(args.stderr_log, "r", encoding="utf-8") as f:
+            stderr_content = f.read().strip()
+    except FileNotFoundError:
+        pass
+    run_tag = config.get("run_tag", "0-0")
+    text = "⚠️ **OpenCodeReview** encountered an error"
+    text += (": %s" % message) if message else "."
+    if stderr_content:
+        text += "\n" + fenced_block(stderr_content)
+    poster = GiteaPoster(pull_base, issue_base, api_token, config)
+    upsert_summary(poster, wrap_summary_body(text, run_tag),
+                   config.get("sticky_summary", True), tag=summary_tag_for(run_tag))
+    sha = env.get("OCR_HEAD_SHA") or (
+        fetch_pull_request(pull_base, api_token, config) or {}).get("head_sha")
+    post_commit_status(repo_base, api_token, sha, "failure",
+                       description="review failed; see the summary comment",
+                       context=env.get("OCR_STATUS_CONTEXT") or "open-code-review",
+                       target_url=env.get("OCR_STATUS_TARGET_URL", ""),
+                       config=config)
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     env = os.environ
@@ -1399,24 +1425,23 @@ def main(argv=None):
         if args.dry_run:
             log("(dry-run: skipping error comment post)")
             return 0
-        stderr_content = ""
-        try:
-            with open(args.stderr_log, "r", encoding="utf-8") as f:
-                stderr_content = f.read().strip()
-        except FileNotFoundError:
-            pass
-        if stderr_content:
-            poster = GiteaPoster(pull_base, issue_base, api_token, config)
-            run_tag = config.get("run_tag", "0-0")
-            body = wrap_summary_body(
-                "⚠️ **OpenCodeReview** encountered an error:\n%s" % fenced_block(stderr_content),
-                run_tag,
-            )
-            upsert_summary(poster, body, config.get("sticky_summary", True),
-                           tag=summary_tag_for(run_tag))
+        report_review_error(args, env, config, pull_base, issue_base, repo_base,
+                            api_token, "")
         return 0
 
     comments = result.get("comments", [])
+
+    # ocr can exit non-zero yet still write valid JSON with no findings (for
+    # example when every LLM call failed). Publishing that as "looks good"
+    # would hide the failure, so it is reported as an error instead.
+    if env.get("OCR_EXIT_CODE") and not comments:
+        write_stats_file(args.stats_file, ZERO_STATS)
+        if args.dry_run:
+            log("(dry-run: review failed; skipping error comment post)")
+            return 0
+        report_review_error(args, env, config, pull_base, issue_base, repo_base,
+                            api_token, result.get("message") or "")
+        return 0
 
     if args.dry_run:
         poster = DryRunPoster()
@@ -1450,8 +1475,9 @@ def main(argv=None):
             log("[dry-run] %s %s" % (name, json.dumps(payload, ensure_ascii=False)[:400]))
         return 0
 
-    # Report the outcome as a commit status so the PR shows a check.
-    state = "failure" if stats["failed"] else "success"
+    # Report the outcome as a commit status so the PR shows a check. A review
+    # that exited non-zero is incomplete even if it produced some findings.
+    state = "failure" if stats["failed"] or env.get("OCR_EXIT_CODE") else "success"
     description = "%d issue(s): %d inline, %d in summary" % (
         stats["total"], stats["inline"], stats["summary"])
     post_commit_status(repo_base, api_token, diff_refs.get("head_sha"), state,

@@ -772,5 +772,61 @@ class StaleHeadTests(unittest.TestCase):
         self.assertEqual(self.published[0]["head_sha"], "reviewed")
 
 
+class FailedReviewTests(unittest.TestCase):
+    """ocr exited non-zero but still wrote JSON: report an error, not LGTM."""
+
+    def _main(self, result_json, exit_code="1"):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        result = os.path.join(tmp, "r.json")
+        with open(result, "w", encoding="utf-8") as f:
+            f.write(result_json)
+        stderr = os.path.join(tmp, "e.log")
+        with open(stderr, "w", encoding="utf-8") as f:
+            f.write("Error: review failed: check your LLM configuration")
+        env = {"GITEA_SERVER_URL": "http://g", "GITEA_REPOSITORY": "o/r",
+               "GITEA_PULL_REQUEST_INDEX": "1", "GITEA_TOKEN": "t",
+               "OCR_HEAD_SHA": "sha1", "OCR_EXIT_CODE": exit_code}
+        saved = dict(os.environ)
+        orig = (pr.GiteaPoster, pr.post_commit_status, pr.publish,
+                pr.fetch_pull_request, pr.fetch_pr_diff)
+        poster = RecordingPoster()
+        self.poster, self.statuses, self.published = poster, [], []
+        pr.GiteaPoster = lambda *a: poster
+        pr.post_commit_status = lambda base, tok, sha, state, **k: self.statuses.append((sha, state))
+        pr.publish = lambda *a, **k: self.published.append(a) or dict(pr.ZERO_STATS, total=1, inline=1)
+        pr.fetch_pull_request = lambda *a: {"head_sha": "sha1"}
+        pr.fetch_pr_diff = lambda *a: PATCH
+        os.environ.clear()
+        os.environ.update(env)
+        try:
+            return pr.main([result, "--stderr-log", stderr,
+                            "--stats-file", os.path.join(tmp, "s.env")])
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            (pr.GiteaPoster, pr.post_commit_status, pr.publish,
+             pr.fetch_pull_request, pr.fetch_pr_diff) = orig
+
+    def test_failed_review_without_findings_is_an_error(self):
+        self._main('{"comments": [], "message": "Review failed: 0 finding(s)"}')
+        self.assertEqual(self.published, [])
+        body = self.poster.created_comments[0]
+        self.assertIn("encountered an error: Review failed", body)
+        self.assertIn("check your LLM configuration", body)
+        self.assertNotIn("✅", body)
+        self.assertEqual(self.statuses, [("sha1", "failure")])
+
+    def test_partial_findings_are_posted_but_the_check_fails(self):
+        self._main('{"comments": [{"path": "src/main.go", "end_line": 11, "content": "c"}]}')
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(self.statuses, [("sha1", "failure")])
+
+    def test_successful_review_keeps_a_passing_check(self):
+        self._main('{"comments": [{"path": "src/main.go", "end_line": 11, "content": "c"}]}',
+                   exit_code="")
+        self.assertEqual(self.statuses, [("sha1", "success")])
+
+
 if __name__ == "__main__":
     unittest.main()

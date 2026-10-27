@@ -13,7 +13,8 @@
 #     path below if you place the script elsewhere).
 #   - Enable "Actions" for the repository (Settings -> Repository ->
 #     Gitea Actions) and register a Gitea Runner.
-#   - The runner needs a job image with node 20+, python3 and git available.
+#   - The runner needs a job image with node 20+, python3 and git 2.41+
+#     (e.g. node:20-trixie; node:20-bookworm ships git 2.39, which ocr rejects).
 #
 # Required CI/CD Variables (Settings -> Actions -> Variables):
 #   OCR_LLM_URL        - LLM API endpoint (e.g., https://api.openai.com/v1/chat/completions)
