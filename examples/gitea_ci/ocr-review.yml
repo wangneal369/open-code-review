@@ -18,7 +18,9 @@
 # Required CI/CD Variables (Settings -> Actions -> Variables):
 #   OCR_LLM_URL        - LLM API endpoint (e.g., https://api.openai.com/v1/chat/completions)
 #   OCR_LLM_AUTH_TOKEN - Authentication token for the LLM API
-#   GITEA_TOKEN        - Gitea access token used to post PR review comments
+#
+# Required CI/CD Secrets (Settings -> Actions -> Secrets):
+#   OCR_GITEA_TOKEN    - Gitea access token used to post PR review comments
 #
 # Optional CI/CD Variables:
 #   OCR_LLM_MODEL      - Model name (e.g., gpt-4o); OCR has no built-in default
@@ -29,6 +31,12 @@
 #                        for OpenAI-compatible APIs
 #   OCR_BACKGROUND     - Business/requirement context passed to `ocr review`
 #   OCR_RULE           - Path to a custom rules JSON file
+#
+# Note on secret naming: Gitea refuses to store a secret whose name starts
+# with `GITEA_` or `GITHUB_`, so the access token is stored as
+# `OCR_GITEA_TOKEN`. Gitea injects its own job token as `GITEA_TOKEN`; the
+# workflow falls back to it when `OCR_GITEA_TOKEN` is not set. The job token
+# cannot post issue comments, so a personal access token is still required.
 
 name: OpenCodeReview PR Review
 
@@ -54,8 +62,11 @@ jobs:
 
       - name: Configure OCR
         env:
-          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
-          OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          # These live in the Variables store, so they are read through the
+          # `vars` context. A value placed in the Secrets store would not be
+          # visible here, and vice versa.
+          OCR_LLM_URL: ${{ vars.OCR_LLM_URL }}
+          OCR_LLM_AUTH_TOKEN: ${{ vars.OCR_LLM_AUTH_TOKEN }}
           OCR_LLM_MODEL: ${{ vars.OCR_LLM_MODEL }}
           OCR_LLM_USE_ANTHROPIC: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
         run: |
@@ -104,5 +115,14 @@ jobs:
           GITEA_SERVER_URL: ${{ github.server_url }}
           GITEA_REPOSITORY: ${{ github.repository }}
           GITEA_PULL_REQUEST_INDEX: ${{ github.event.pull_request.number }}
+          # `OCR_GITEA_TOKEN` is the personal access token stored in the
+          # Secrets store. Gitea injects its own job token as `GITEA_TOKEN`;
+          # it is used as a fallback only, because the job token lacks the
+          # issue scopes the summary comment needs. The fallback is resolved
+          # in the shell rather than with a `||` expression so that it does
+          # not depend on how an unset secret is evaluated.
+          OCR_GITEA_TOKEN: ${{ secrets.OCR_GITEA_TOKEN }}
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-        run: python3 post_review.py .ocr/ocr-result.json
+        run: |
+          export GITEA_TOKEN="${OCR_GITEA_TOKEN:-$GITEA_TOKEN}"
+          python3 post_review.py .ocr/ocr-result.json

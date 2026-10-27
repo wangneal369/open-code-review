@@ -29,27 +29,72 @@ cp ocr-review.yml .gitea/workflows/ocr-review.yml
 cp post_review.py .gitea/workflows/post_review.py
 ```
 
-### 2. Configure CI/CD Variables
+### 2. Configure CI/CD Variables and Secrets
 
-Go to your repository's **Settings → Actions → Variables** and add:
+Gitea stores variables and secrets in **two separate places**, and a value in
+one is not readable from the other:
 
-| Variable | Required | Masked | Description |
-|----------|----------|--------|-------------|
-| `OCR_LLM_URL` | Yes | No | LLM API endpoint URL (e.g., `https://api.openai.com/v1/chat/completions`) |
-| `OCR_LLM_AUTH_TOKEN` | Yes | Yes | API authentication token |
-| `GITEA_TOKEN` | Yes | Yes | Gitea access token used to post the review |
-| `OCR_LLM_MODEL` | No | No | Model name (e.g., `gpt-4o`) — OCR has no built-in default model and fails when this is unset |
-| `OCR_VERSION` | No | No | npm version spec for `@alibaba-group/open-code-review` (default: `latest`). Pin it (e.g. `1.9.0`) for reproducible reviews. |
-| `OCR_LLM_USE_ANTHROPIC` | No | No | `true` for the Anthropic API format, `false` (default) for OpenAI-compatible APIs |
-| `OCR_BACKGROUND` | No | No | Business/requirement context, passed via `ocr review --background` |
-| `OCR_RULE` | No | No | Path to a custom rules JSON file, passed via `ocr review --rule` |
-| `OCR_LLM_AUTH_HEADER` | No | No | Custom auth header name, written via `ocr config set llm.auth_header` |
-| `OCR_LLM_EXTRA_HEADERS` | No | No | Extra headers `K=V,K=V`, written via `ocr config set llm.extra_headers` |
-| `OCR_LLM_TIMEOUT` | No | No | LLM request timeout in seconds (read natively by OCR from the env) |
-| `OCR_REVIEW_CONCURRENCY` | No | No | Max concurrent file reviews, passed via `ocr review --concurrency` (default: 8) |
+| Store | UI location | Read as |
+|-------|-------------|---------|
+| Variables | Settings → Actions → **Variables** | `${{ vars.NAME }}` |
+| Secrets | Settings → Actions → **Secrets** | `${{ secrets.NAME }}` |
+
+A value added to the Variables page is **not** visible to `${{ secrets.X }}`,
+and a secret is **not** visible to `${{ vars.X }}`. Add each entry to the
+store that matches the table below.
+
+#### Secrets — Settings → Actions → Secrets
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `OCR_GITEA_TOKEN` | Yes | Gitea access token used to post the review (scopes below) |
+
+> **Why not `GITEA_TOKEN`?** Gitea rejects any secret whose name starts with
+> `GITEA_` or `GITHUB_` (`400: name cannot start with 'GITEA_' or 'GITHUB_'`).
+> `GITEA_TOKEN` is reserved for Gitea's built-in job token, which the workflow
+> uses as a fallback only — that token cannot write issue comments, so a
+> personal access token is still required.
+
+#### Variables — Settings → Actions → Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OCR_LLM_URL` | Yes | LLM API endpoint URL (e.g. `https://api.openai.com/v1/chat/completions`) |
+| `OCR_LLM_AUTH_TOKEN` | Yes | API authentication token |
+| `OCR_LLM_MODEL` | No | Model name (e.g. `gpt-4o`) — OCR has no built-in default model and fails when this is unset |
+| `OCR_VERSION` | No | npm version spec for `@alibaba-group/open-code-review` (default: `latest`). Pin it (e.g. `1.9.0`) for reproducible reviews. |
+| `OCR_LLM_USE_ANTHROPIC` | No | `true` for the Anthropic API format, `false` (default) for OpenAI-compatible APIs |
+| `OCR_BACKGROUND` | No | Business/requirement context, passed via `ocr review --background` |
+| `OCR_RULE` | No | Path to a custom rules JSON file, passed via `ocr review --rule` |
+| `OCR_LLM_AUTH_HEADER` | No | Custom auth header name, written via `ocr config set llm.auth_header` |
+| `OCR_LLM_EXTRA_HEADERS` | No | Extra headers `K=V,K=V`, written via `ocr config set llm.extra_headers` |
+| `OCR_LLM_TIMEOUT` | No | LLM request timeout in seconds (read natively by OCR from the env) |
+| `OCR_REVIEW_CONCURRENCY` | No | Max concurrent file reviews, passed via `ocr review --concurrency` (default: 8) |
+
+Variable names are stored upper-case, and names starting with `GITEA_`,
+`GITHUB_` or `CI` are rejected — the same rules apply to secrets.
 
 > **Note:** The workflow sets `llm.extra_body` to disable thinking mode for
 > compatibility with various LLM providers.
+
+#### Configure them from the command line
+
+The `setup_variables.py` helper in this directory creates every entry through
+the Gitea API, so the two stores cannot get mixed up:
+
+```bash
+python3 setup_variables.py \
+  --server http://gitea.example.com \
+  --owner myorg --repo myrepo \
+  --token "$GITEA_PAT" \
+  --llm-url https://api.openai.com/v1/chat/completions \
+  --llm-token "$LLM_TOKEN" \
+  --gitea-token "$GITEA_PAT"
+```
+
+It is idempotent: existing entries are updated in place rather than
+duplicated. Run it with `--dry-run` first to print the planned changes
+without touching the instance.
 
 ### 3. Create a Gitea Access Token
 
@@ -76,7 +121,8 @@ Options:
 - **Personal Access Token** (recommended): User Settings → Applications → Generate Token with the scopes above
 - **Repository Access Token**: Settings → Actions → Runners → ... → or use an organization token
 
-Set it as the `GITEA_TOKEN` repository variable (masked).
+Store it as the `OCR_GITEA_TOKEN` repository **secret** (Settings → Actions →
+Secrets).
 
 > **Tip:** The token owner is the author of the review comments. Use a
 > dedicated bot account if you want the comments to appear under a distinct
@@ -190,6 +236,7 @@ Common issues:
 2. **"Cannot find merge-base"** — the checkout was shallow. The workflow uses `fetch-depth: 0`; if you changed it, restore the full history.
 3. **A finding shows up in the summary instead of inline** — its line is not part of the pull request diff, so it cannot be anchored. The summary entry says so explicitly.
 4. **"Failed to parse OCR output"** — `OCR_LLM_URL` and `OCR_LLM_AUTH_TOKEN` are unset, or the review crashed. The OCR stderr log is included in the summary comment in that case.
+5. **The workflow cannot see a value you just added** — it was added to the wrong store. Variables are only readable through `${{ vars.NAME }}` and secrets only through `${{ secrets.NAME }}`; neither store is visible to the other. `setup_variables.py` writes each entry to the right one, and `setup_variables_test.py` asserts that the workflow, the README and the helper agree on the assignment.
 
 ## Testing
 
@@ -204,7 +251,7 @@ python3 post_review_test.py
 python3 -m unittest discover -s examples/gitea_ci -p '*_test.py'
 ```
 
-Two additional test suites live next to the script:
+Three additional test suites live next to the script:
 
 - `parity_test.py` loads the GitLab example side by side with this one and
   asserts that both produce the same badges, routing decisions, ordering,
@@ -212,6 +259,10 @@ Two additional test suites live next to the script:
   deliberate platform differences (summary wording, run-tag source,
   comment-id strategy, transport shape) are asserted explicitly so they stay
   intentional instead of drifting apart unnoticed.
+- `setup_variables_test.py` covers the CI/CD variable setup helper: the
+  reserved-name rules of both stores, the create-versus-update API
+  semantics, and the agreement between the workflow, the README and the
+  helper about which store each value belongs to.
 - `e2e_test.py` drives a real Gitea instance. It creates a repository, seeds
   a base branch, opens a pull request, runs the posting script against it
   and then asserts on the state Gitea actually stored: the inline review
