@@ -8,9 +8,9 @@
 # which keep platform-specific publishing out of the `ocr` binary.
 #
 # Setup:
-#   - Commit BOTH this file and post_review.py into your repository (adjust
-#     the `python3 post_review.py` path below if you place the script
-#     elsewhere).
+#   - Commit BOTH this file and post_review.py into .gitea/workflows/ of
+#     your repository (adjust the `python3 .gitea/workflows/post_review.py`
+#     path below if you place the script elsewhere).
 #   - Enable "Actions" for the repository (Settings -> Repository ->
 #     Gitea Actions) and register a Gitea Runner.
 #   - The runner needs a job image with node 20+, python3 and git available.
@@ -159,7 +159,7 @@ jobs:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           export GITEA_TOKEN="${OCR_GITEA_TOKEN:-$GITEA_TOKEN}"
-          python3 post_review.py .ocr/ocr-result.json
+          python3 .gitea/workflows/post_review.py .ocr/ocr-result.json
           if [ -n "$OCR_EXIT_CODE" ]; then
             echo "ocr review exited with code ${OCR_EXIT_CODE}; see the PR summary for stderr."
             exit 1

@@ -20,7 +20,7 @@ PR Opened/Updated -> Gitea Actions triggered -> OCR reviews the diff -> Review p
 ### 1. Copy the workflow and script files
 
 Copy **both** `ocr-review.yml` and `post_review.py` to your repository's
-`.gitea/workflows/` directory (adjust the `python3 post_review.py` path in
+`.gitea/workflows/` directory (adjust the `python3 .gitea/workflows/post_review.py` path in
 the YAML if you place the script elsewhere):
 
 ```bash

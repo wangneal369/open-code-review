@@ -283,6 +283,12 @@ class WorkflowContractTests(unittest.TestCase):
         for name in sv.VARIABLE_NAMES:
             self.assertIn("vars.%s }}" % name, self.workflow)
 
+    def test_script_path_matches_the_documented_install_location(self):
+        # The README copies the script into .gitea/workflows/, and the step
+        # runs from the repository root.
+        self.assertIn("cp post_review.py .gitea/workflows/post_review.py", self.readme)
+        self.assertIn("python3 .gitea/workflows/post_review.py", self.workflow)
+
     def test_readme_documents_the_two_stores_separately(self):
         self.assertIn("Settings", self.readme)
         self.assertIn("Actions", self.readme)
