@@ -1,0 +1,30 @@
+# OpenCodeReview - Gitea Actions PR review on a Windows client runner
+#
+# Variant of ocr-review.yml for a Windows machine without Docker. The job
+# runs on a runner registered with the `ocr-windows` host label by the OCR
+# review service (windows-service/ next to this file), which
+# bundles act_runner, git and ocr and keeps the LLM settings and the bot
+# token on that machine, encrypted per Windows user.
+#
+# The single step calls `ocr-review.exe`, which reads the pull request from
+# the event file, fetches it, runs ocr and posts the result. The repository
+# therefore needs no secrets or variables of its own.
+#
+# Host-mode jobs run directly on the client without isolation: anyone who can
+# open a pull request can change this file and run commands on that machine.
+# Register the runner only for trusted repositories or organizations.
+
+name: OpenCodeReview PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-review:
+    runs-on: ocr-windows
+    timeout-minutes: 30
+    steps:
+      - name: Review the pull request
+        shell: cmd
+        run: ocr-review.exe

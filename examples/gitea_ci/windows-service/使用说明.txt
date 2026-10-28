@@ -1,0 +1,49 @@
+OCR 评审服务（绿色版）使用说明
+==============================
+
+作用：在本机运行一个 Gitea Actions runner。仓库启用后，每当有 PR 新建或更新，
+本机自动拉取代码、调用大模型评审，并把评审意见以评论形式贴到 PR 上。
+不需要 Docker，不需要安装 Python 或 Git，解压即用。
+
+一、启动
+  解压到任意目录（建议路径不含空格以外的特殊字符），双击 ocr-service.exe。
+  关闭窗口只会隐藏到右下角托盘；彻底退出请在托盘图标右键 →「退出」。
+
+二、首次配置（主界面三步）
+  ① 连接 Gitea 并注册本机 runner
+     - Gitea 地址：如 http://gitea.example.com:3000
+     - Runner 注册令牌：在 Gitea 中获取，级别决定能服务的仓库范围：
+         仓库 设置 → Actions → Runners → 创建 Runner：只服务该仓库
+         组织 设置 → Actions → Runners → 创建 Runner：服务该组织所有仓库（推荐）
+         站点管理 → Actions → Runners：服务全站（需要管理员）
+     - 点「注册」。注册令牌只用一次，不会保存。
+
+  ② 评审设置
+     - LLM 接口地址 / 模型名 / LLM 密钥 / 接口格式（openai 或 anthropic）
+     - Bot 令牌：用来发评论的 Gitea 账号的访问令牌（用户设置 → 应用 → 生成令牌），需要权限：
+         write:repository、write:issue、read:organization、read:user
+     - 同时评审数：同时处理几个 PR，其余排队（1~4）
+     - 点「保存」，会先校验 Bot 令牌是否可用。
+
+  ③ 仓库接入
+     - 填组织名或用户名，点「加载仓库」，列出全部仓库及状态。
+     - 双击仓库切换启用/停用；也可多选后点「启用所选」「停用所选」，或「全部启用」。
+     - 启用 = 向仓库默认分支提交 .gitea/workflows/ocr-review.yml；停用 = 删除该文件。
+
+三、日常使用
+  - 托盘图标：绿色 = 运行中，灰色 = 已停止，红色 = 异常（自动重启中）。
+  - 托盘右键菜单可启动/停止/重启 runner、打开日志目录、设置「开机自启」。
+  - 开机自启时程序只在托盘运行，不弹窗。
+
+四、文件说明
+  ocr-service.exe   托盘程序（本程序）
+  ocr-review.exe    评审命令，由 runner 自动调用，无需手动运行
+  bin\              内置的 act_runner、ocr、Git
+  data\             首次运行后生成：设置、runner 注册信息、日志（data\logs\runner.log）
+  整个文件夹可整体移动；移动后若开启了开机自启，请在托盘菜单中重新勾选一次。
+
+五、注意事项
+  - LLM 密钥和 Bot 令牌按当前 Windows 用户加密保存。换电脑或换 Windows 账号后无法解密，需重新填写。
+  - 评审直接在本机执行（不隔离）。能向仓库提 PR 的人可以修改 workflow 并在本机执行命令，
+    请只为可信的仓库或组织注册 runner。
+  - 本机需能访问 Gitea 地址和 LLM 接口地址。
